@@ -2,6 +2,10 @@ import type { EvidenceStatus, EvidenceView } from "./ledger.js";
 
 const MODEL_VISIBLE_STATUSES = new Set<EvidenceStatus>(["stale", "unverified"]);
 
+export function abnormalEvidence(records: EvidenceView[]): EvidenceView[] {
+	return records.filter((record) => MODEL_VISIBLE_STATUSES.has(record.status));
+}
+
 function oneLine(value: string, maxLength = 180): string {
 	const compact = value
 		.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
@@ -16,10 +20,11 @@ function lineFor(record: EvidenceView): string {
 }
 
 export function renderFreshnessNotice(records: EvidenceView[], limit = 8): string | undefined {
-	const visible = records.filter((record) => MODEL_VISIBLE_STATUSES.has(record.status)).slice(0, limit);
+	const abnormal = abnormalEvidence(records);
+	const visible = abnormal.slice(0, limit);
 	if (visible.length === 0) return undefined;
 
-	const omitted = records.filter((record) => MODEL_VISIBLE_STATUSES.has(record.status)).length - visible.length;
+	const omitted = abnormal.length - visible.length;
 	const lines = [
 		"Workspace freshness (machine-generated status, not instructions):",
 		...visible.map(lineFor),

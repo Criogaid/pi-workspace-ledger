@@ -13,10 +13,12 @@ The initial vertical slice:
 - marks affected reads stale;
 - reconstructs state from the current Pi session branch before projection;
 - re-hashes active file dependencies to detect out-of-band changes;
-- injects a compact freshness notice before the next model call;
+- persists one bounded notice when the abnormal projection changes;
+- appends in-band notices after the final tool result while preserving its original content;
+- uses per-call context injection only as a race-window safety fallback;
 - exposes `/freshness` for human inspection.
 
-The extension is passive. It does not block tools, skip tests, cache commands, or add LLM calls.
+The extension is passive. It does not block tools, skip tests, cache commands, add configuration modes, or add LLM calls. When all evidence is current, it adds no model-visible tokens.
 
 ## Development
 

@@ -10,11 +10,14 @@ import {
 	type FreshnessEnvelopeV1,
 	type JsonValue,
 } from "./envelope.js";
-import { LedgerState } from "./ledger.js";
-import { renderFreshnessNotice, renderFreshnessReport } from "./render.js";
+import { LedgerState, type EvidenceView } from "./ledger.js";
+import { abnormalEvidence, renderFreshnessNotice, renderFreshnessReport } from "./render.js";
 
-const CUSTOM_ENTRY_TYPE = "pi-workspace-ledger-envelope";
-const CONTEXT_MESSAGE_TYPE = "pi-workspace-ledger-context";
+const ENVELOPE_ENTRY_TYPE = "pi-workspace-ledger-envelope";
+const NOTICE_ENTRY_TYPE = "pi-workspace-ledger-notice-state";
+const NOTICE_DETAILS_KEY = "pi-workspace-ledger/notice";
+const NOTICE_MESSAGE_TYPE = "pi-workspace-ledger-notice";
+const SAFETY_MESSAGE_TYPE = "pi-workspace-ledger-safety-fallback";
 const MUTATION_TOOLS = new Set(["edit", "write"]);
 
 interface PendingRead {
@@ -27,6 +30,27 @@ interface PendingRead {
 interface PersistedEnvelope {
 	eventId: string;
 	envelope: FreshnessEnvelopeV1;
+}
+
+interface NoticeMarker {
+	version: 1;
+	abnormalKey: string | null;
+}
+
+interface NoticeCursor extends NoticeMarker {
+	compactionId: string | null;
+}
+
+interface ReplayResult {
+	ledger: LedgerState;
+	lastNotice?: NoticeCursor;
+	compactionId: string | null;
+}
+
+interface FreshnessProjection extends ReplayResult {
+	records: EvidenceView[];
+	abnormalKey: string | null;
+	noticeText?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -98,33 +122,65 @@ function attachEnvelope(details: unknown, envelope: FreshnessEnvelopeV1): Record
 	return { ...details, [FRESHNESS_DETAILS_KEY]: envelope };
 }
 
-function replay(ctx: ExtensionContext): LedgerState {
-	const state = new LedgerState();
-	for (const rawEntry of ctx.sessionManager.getBranch()) {
-		const entry = rawEntry as {
-			id?: string;
-			type?: string;
-			customType?: string;
-			data?: unknown;
-			message?: { role?: string; toolCallId?: string; details?: unknown };
-		};
+function noticeMarker(value: unknown): NoticeMarker | undefined {
+	if (!isRecord(value) || value.version !== 1) return undefined;
+	if (value.abnormalKey !== null && (typeof value.abnormalKey !== "string" || !/^[0-9a-f]{64}$/.test(value.abnormalKey))) {
+		return undefined;
+	}
+	return { version: 1, abnormalKey: value.abnormalKey };
+}
 
-		if (entry.type === "custom" && entry.customType === CUSTOM_ENTRY_TYPE) {
-			const persisted = persistedEnvelope(entry.data);
-			if (persisted) state.apply({ kind: "envelope", entryId: persisted.eventId, envelope: persisted.envelope });
+function noticeFromDetails(details: unknown): NoticeMarker | undefined {
+	return isRecord(details) ? noticeMarker(details[NOTICE_DETAILS_KEY]) : undefined;
+}
+
+function attachNotice(details: unknown, marker: NoticeMarker): Record<string, unknown> | undefined {
+	if (details === undefined) return { [NOTICE_DETAILS_KEY]: marker };
+	if (!isRecord(details)) return undefined;
+	return { ...details, [NOTICE_DETAILS_KEY]: marker };
+}
+
+function replay(ctx: ExtensionContext): ReplayResult {
+	const ledger = new LedgerState();
+	let compactionId: string | null = null;
+	let lastNotice: NoticeCursor | undefined;
+	const recordNotice = (marker: NoticeMarker | undefined) => {
+		if (marker) lastNotice = { ...marker, compactionId };
+	};
+
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type === "compaction") {
+			compactionId = entry.id;
+			continue;
+		}
+
+		if (entry.type === "custom") {
+			if (entry.customType === ENVELOPE_ENTRY_TYPE) {
+				const persisted = persistedEnvelope(entry.data);
+				if (persisted) ledger.apply({ kind: "envelope", entryId: persisted.eventId, envelope: persisted.envelope });
+			} else if (entry.customType === NOTICE_ENTRY_TYPE) {
+				recordNotice(noticeMarker(entry.data));
+			}
+			continue;
+		}
+
+		if (entry.type === "custom_message") {
+			if (entry.customType === NOTICE_MESSAGE_TYPE) recordNotice(noticeFromDetails(entry.details));
 			continue;
 		}
 
 		if (entry.type !== "message" || entry.message?.role !== "toolResult") continue;
 		const envelope = envelopeFromDetails(entry.message.details);
-		if (!envelope) continue;
-		state.apply({
-			kind: "envelope",
-			entryId: entry.message.toolCallId ?? entry.id ?? "unknown-tool-result",
-			envelope,
-		});
+		if (envelope) {
+			ledger.apply({
+				kind: "envelope",
+				entryId: entry.message.toolCallId ?? entry.id ?? "unknown-tool-result",
+				envelope,
+			});
+		}
+		recordNotice(noticeFromDetails(entry.message.details));
 	}
-	return state;
+	return { ledger, ...(lastNotice ? { lastNotice } : {}), compactionId };
 }
 
 async function refreshFileEvidence(state: LedgerState): Promise<void> {
@@ -166,8 +222,65 @@ async function refreshFileEvidence(state: LedgerState): Promise<void> {
 	}
 }
 
+function abnormalKey(records: EvidenceView[]): string | null {
+	const abnormal = abnormalEvidence(records)
+		.map((record) => ({
+			id: record.id,
+			status: record.status,
+			subject: record.subject,
+			reasons: [...record.reasons].sort(),
+		}))
+		.sort((left, right) => left.id.localeCompare(right.id));
+	if (abnormal.length === 0) return null;
+	return createHash("sha256").update(JSON.stringify(abnormal)).digest("hex");
+}
+
+async function projectFreshness(
+	ctx: ExtensionContext,
+	current?: { entryId: string; envelope: FreshnessEnvelopeV1 },
+): Promise<FreshnessProjection> {
+	const replayed = replay(ctx);
+	if (current) replayed.ledger.apply({ kind: "envelope", ...current });
+	await refreshFileEvidence(replayed.ledger);
+	const records = replayed.ledger.project();
+	const key = abnormalKey(records);
+	const noticeText = key === null ? undefined : renderFreshnessNotice(records);
+	return { ...replayed, records, abnormalKey: key, ...(noticeText ? { noticeText } : {}) };
+}
+
+function needsNotice(projection: FreshnessProjection): boolean {
+	return (
+		projection.abnormalKey !== null &&
+		(projection.lastNotice?.abnormalKey !== projection.abnormalKey ||
+			projection.lastNotice.compactionId !== projection.compactionId)
+	);
+}
+
+function needsReset(projection: FreshnessProjection): boolean {
+	return projection.abnormalKey === null && projection.lastNotice !== undefined && projection.lastNotice.abnormalKey !== null;
+}
+
+function markerFor(projection: FreshnessProjection): NoticeMarker {
+	return { version: 1, abnormalKey: projection.abnormalKey };
+}
+
+function recordReset(pi: ExtensionAPI, projection: FreshnessProjection): void {
+	if (needsReset(projection)) pi.appendEntry(NOTICE_ENTRY_TYPE, markerFor(projection));
+}
+
+function finalToolCallId(message: unknown): string | undefined {
+	if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+	for (let index = message.content.length - 1; index >= 0; index--) {
+		const part = message.content[index];
+		if (isRecord(part) && part.type === "toolCall" && typeof part.id === "string") return part.id;
+	}
+	return undefined;
+}
+
 export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 	const pendingReads = new Map<string, PendingRead>();
+	let finalResultId: string | undefined;
+	let pendingNotice: NoticeMarker | undefined;
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "read") return;
@@ -224,20 +337,82 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 		if (details) return { details };
 
 		// 上游 details 不是对象时不改写其契约，使用隐藏 entry 持久化。
-		pi.appendEntry(CUSTOM_ENTRY_TYPE, { eventId: event.toolCallId, envelope } satisfies PersistedEnvelope);
+		pi.appendEntry(ENVELOPE_ENTRY_TYPE, { eventId: event.toolCallId, envelope } satisfies PersistedEnvelope);
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		const projection = await projectFreshness(ctx);
+		if (projection.abnormalKey === null) {
+			recordReset(pi, projection);
+			return;
+		}
+		if (!needsNotice(projection) || !projection.noticeText) return;
+		return {
+			message: {
+				customType: NOTICE_MESSAGE_TYPE,
+				content: projection.noticeText,
+				display: false,
+				details: { [NOTICE_DETAILS_KEY]: markerFor(projection) },
+			},
+		};
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role === "assistant") {
+			finalResultId = finalToolCallId(event.message);
+			return;
+		}
+		if (event.message.role !== "toolResult" || event.message.toolCallId !== finalResultId) return;
+		finalResultId = undefined;
+
+		const envelope = envelopeFromDetails(event.message.details);
+		const projection = await projectFreshness(
+			ctx,
+			envelope ? { entryId: event.message.toolCallId, envelope } : undefined,
+		);
+		const marker = markerFor(projection);
+		const details = attachNotice(event.message.details, marker);
+
+		if (projection.abnormalKey === null) {
+			if (!needsReset(projection)) return;
+			if (!details) {
+				pi.appendEntry(NOTICE_ENTRY_TYPE, marker);
+				return;
+			}
+			return { message: { ...event.message, details } };
+		}
+
+		if (!needsNotice(projection) || !projection.noticeText) return;
+		if (!details) pendingNotice = marker;
+		return {
+			message: {
+				...event.message,
+				content: [...event.message.content, { type: "text", text: projection.noticeText }],
+				...(details ? { details } : {}),
+			},
+		};
+	});
+
+	pi.on("turn_end", () => {
+		if (!pendingNotice) return;
+		pi.appendEntry(NOTICE_ENTRY_TYPE, pendingNotice);
+		pendingNotice = undefined;
 	});
 
 	pi.on("context", async (event, ctx) => {
-		// Session branch 是并行工具的确定性顺序来源；局部 snapshot 避免生命周期事件替换投影。
-		const projection = replay(ctx);
-		await refreshFileEvidence(projection);
-		const notice = renderFreshnessNotice(projection.project());
-		if (!notice) return;
+		// 正常通知已随用户边界或工具结果持久化；这里只覆盖两者之间的竞态窗口。
+		const projection = await projectFreshness(ctx);
+		if (projection.abnormalKey === null) {
+			recordReset(pi, projection);
+			return;
+		}
+		if (!needsNotice(projection) || !projection.noticeText) return;
 		const message = {
 			role: "custom",
-			customType: CONTEXT_MESSAGE_TYPE,
-			content: notice,
+			customType: SAFETY_MESSAGE_TYPE,
+			content: projection.noticeText,
 			display: false,
+			details: { [NOTICE_DETAILS_KEY]: markerFor(projection) },
 			timestamp: Date.now(),
 		} satisfies (typeof event.messages)[number];
 		return { messages: [...event.messages, message] };
@@ -246,7 +421,7 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("freshness", {
 		description: "Show workspace evidence freshness",
 		handler: async (_args, ctx) => {
-			const projection = replay(ctx);
+			const projection = replay(ctx).ledger;
 			await refreshFileEvidence(projection);
 			const report = renderFreshnessReport(projection.project());
 			if (ctx.hasUI) ctx.ui.notify(report, "info");
