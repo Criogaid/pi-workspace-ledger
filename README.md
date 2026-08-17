@@ -52,12 +52,6 @@ Then restart or reload Pi and run:
 
 Only stale and unverified evidence is added to model context. Opaque stamps and session entry IDs remain host-only.
 
-## Documents
-
-- [Development plan](./PLAN.md)
-- [Research record](./docs/research.md)
-- [Concept and protocol notes](./docs/concept.md)
-- [Implementation progress](./PROGRESS.md)
 
 ## Project Policy
 

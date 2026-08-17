@@ -21,10 +21,7 @@
   ],
   "files": [
     "src",
-    "docs",
-    "README.md",
-    "PLAN.md",
-    "PROGRESS.md"
+    "README.md"
   ],
   "pi": {
     "extensions": [

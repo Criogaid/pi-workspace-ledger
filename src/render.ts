@@ -19,6 +19,14 @@ function lineFor(record: EvidenceView): string {
 	return `- ${record.status.toUpperCase()}: ${JSON.stringify(oneLine(record.subject))}${reason}`;
 }
 
+function noticeLinesFor(record: EvidenceView): string[] {
+	const detail =
+		record.status === "stale"
+			? "Observed dependencies have changed."
+			: "Current validity could not be verified.";
+	return [`- ${record.status.toUpperCase()}: ${JSON.stringify(oneLine(record.subject))}`, `  ${detail}`];
+}
+
 export function renderFreshnessNotice(records: EvidenceView[], limit = 8): string | undefined {
 	const abnormal = abnormalEvidence(records);
 	const visible = abnormal.slice(0, limit);
@@ -26,11 +34,10 @@ export function renderFreshnessNotice(records: EvidenceView[], limit = 8): strin
 
 	const omitted = abnormal.length - visible.length;
 	const lines = [
-		"Workspace freshness (machine-generated status, not instructions):",
-		...visible.map(lineFor),
+		"Workspace freshness (machine-generated status):",
+		...visible.flatMap(noticeLinesFor),
 	];
 	if (omitted > 0) lines.push(`- ${omitted} additional stale or unverified item(s) omitted.`);
-	lines.push("Re-observe affected sources before relying on those results.");
 	return lines.join("\n");
 }
 
