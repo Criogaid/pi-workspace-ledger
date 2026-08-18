@@ -1,6 +1,6 @@
 # pi-workspace-ledger
 
-A passive Pi extension that tracks whether supported tool evidence is still valid for the current workspace.
+A passive Pi extension that tracks whether recent supported tool evidence is still valid for the current workspace.
 
 The project generalizes the freshness principle behind hashline edits: a write should not rely on a stale location, and an Agent decision should not silently rely on stale observations.
 
@@ -8,17 +8,22 @@ The project generalizes the freshness principle behind hashline edits: a write s
 
 The initial vertical slice:
 
-- records exact file-content evidence for successful `read` calls when pre/post hashes match;
+- records exact whole-file content evidence for successful `read` calls on logical paths inside the current workspace when pre/post hashes match;
+- keeps each plugin-produced read active for the next three `role: user` session entries, independently of other reads;
+- starts a new read epoch after session restore, `/resume`, `/tree`, `/fork`, `/clone`, and every compaction;
+- preserves the current read epoch across `/reload`;
 - records file-content changes from successful `edit` and `write` calls;
-- marks affected reads stale;
 - reconstructs state from the current Pi session branch before projection;
-- re-hashes active file dependencies to detect out-of-band changes;
-- persists one bounded notice when the abnormal projection changes;
-- appends in-band notices after the final tool result while preserving its original content;
-- uses per-call context injection only as a race-window safety fallback;
+- streams SHA-256 over active dependencies and hashes a shared physical target once per projection;
+- detects out-of-band changes, including a workspace symlink being retargeted;
+- retains notice markers for session audit while filtering obsolete notices from model context;
 - exposes `/freshness` for human inspection.
 
-The extension is passive. It does not block tools, skip tests, cache commands, add configuration modes, or add LLM calls. When all evidence is current, it adds no model-visible tokens.
+The extension is passive. It does not block tools, skip tests, cache commands, add configuration modes, start file watchers, or add LLM calls. When no active evidence is stale or unverified, it adds no model-visible tokens.
+
+## Read Lifetime
+
+The three-entry window applies only to reads produced by this extension after the bounded policy was introduced. Existing unmarked session evidence and third-party Envelope v1 producers retain their original lifecycle. Partial reads still depend on the whole file, and every persisted `role: user` entry counts toward the window. A read made while handling the current user entry does not consume that entry; it expires before the fourth subsequent user entry is projected.
 
 ## Development
 
@@ -50,7 +55,7 @@ Then restart or reload Pi and run:
 - `unverified`: dependency coverage is incomplete or cannot be resolved.
 - `superseded`: newer evidence replaced the same subject.
 
-Only stale and unverified evidence is added to model context. Opaque stamps and session entry IDs remain host-only.
+Only currently active stale and unverified evidence is projected into model context. Opaque stamps, retention markers, and session entry/evidence IDs remain host-only.
 
 
 ## Project Policy

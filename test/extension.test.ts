@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -11,6 +11,7 @@ import workspaceLedgerExtension from "../src/extension.js";
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
 const NOTICE_DETAILS_KEY = "pi-workspace-ledger/notice";
+const READ_DETAILS_KEY = "pi-workspace-ledger/read-retention";
 
 function fakePi(branch?: unknown[]) {
 	const handlers = new Map<string, Handler[]>();
@@ -50,8 +51,9 @@ async function recordReadEvidence(
 	branch: unknown[],
 	path: string,
 	toolCallId = "read-1",
-): Promise<void> {
-	const input = { path };
+	options: { offset?: number; limit?: number } = {},
+): Promise<Record<string, unknown>> {
+	const input = { path, ...options };
 	await call(handlers, "tool_call", { toolName: "read", toolCallId, input }, ctx);
 	const patch = (await call(
 		handlers,
@@ -70,10 +72,15 @@ async function recordReadEvidence(
 			details: patch.details,
 		},
 	});
+	return patch.details;
 }
 
 function persistNotice(branch: unknown[], id: string, message: Record<string, unknown>): void {
 	branch.push({ id, type: "custom_message", ...message });
+}
+
+function recordUserMessage(branch: unknown[], id: string): void {
+	branch.push({ id, type: "message", message: { role: "user", content: id } });
 }
 
 const temporaryDirectories: string[] = [];
@@ -314,7 +321,7 @@ describe("Pi extension vertical slice", () => {
 		assert.match(String(siblingNotice.message.content), /STALE/);
 	});
 
-	it("appends one notice to the final tool result in a batch", async () => {
+	it("projects one notice after the final tool result in a batch", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
 		temporaryDirectories.push(cwd);
 		const source = join(cwd, "source.ts");
@@ -364,11 +371,14 @@ describe("Pi extension vertical slice", () => {
 		const replacement = (await call(handlers, "message_end", { message: finalResult }, ctx)) as {
 			message: typeof finalResult;
 		};
-		assert.deepEqual(replacement.message.content[0], finalResult.content[0]);
-		assert.match(replacement.message.content[1]?.text ?? "", /STALE/);
+		assert.deepEqual(replacement.message.content, finalResult.content);
 		assert.ok(replacement.message.details[NOTICE_DETAILS_KEY]);
 		branch.push({ id: "entry-edit-2", type: "message", message: replacement.message });
-		assert.equal(await call(handlers, "context", { messages: [replacement.message] }, ctx), undefined);
+		const contextPatch = (await call(handlers, "context", { messages: [replacement.message] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.deepEqual(contextPatch.messages[0]?.content, finalResult.content);
+		assert.match(String(contextPatch.messages[1]?.content), /STALE/);
 	});
 
 	it("persists a primitive-details notice marker after the tool result", async () => {
@@ -398,14 +408,15 @@ describe("Pi extension vertical slice", () => {
 			content: [{ type: "text", text: "edited" }],
 			details: 7,
 		};
-		const replacement = (await call(handlers, "message_end", { message: result }, ctx)) as {
-			message: typeof result;
-		};
-		assert.equal(replacement.message.details, 7);
-		assert.match(replacement.message.content[1]?.text ?? "", /STALE/);
-		branch.push({ id: "entry-edit", type: "message", message: replacement.message });
+		assert.equal(await call(handlers, "message_end", { message: result }, ctx), undefined);
+		branch.push({ id: "entry-edit", type: "message", message: result });
 		await call(handlers, "turn_end", {}, ctx);
 		assert.equal(customEntries.at(-1)?.customType, "pi-workspace-ledger-notice-state");
+		const contextPatch = (await call(handlers, "context", { messages: [result] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.deepEqual(contextPatch.messages[0]?.content, result.content);
+		assert.match(String(contextPatch.messages[1]?.content), /STALE/);
 
 		const resumed = fakePi(branch);
 		workspaceLedgerExtension(resumed.api);
@@ -438,7 +449,7 @@ describe("Pi extension vertical slice", () => {
 		assert.match(String(repeated.message.content), /STALE/);
 	});
 
-	it("emits one checkpoint for each compaction epoch while evidence stays abnormal", async () => {
+	it("starts a new read epoch after compaction", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
 		temporaryDirectories.push(cwd);
 		const source = join(cwd, "source.ts");
@@ -453,11 +464,206 @@ describe("Pi extension vertical slice", () => {
 		persistNotice(branch, "notice-1", first.message);
 		branch.push({ id: "compact-1", type: "compaction" });
 
-		const checkpoint = (await call(handlers, "before_agent_start", {}, ctx)) as {
-			message: Record<string, unknown>;
-		};
-		assert.match(String(checkpoint.message.content), /STALE/);
-		persistNotice(branch, "notice-2", checkpoint.message);
 		assert.equal(await call(handlers, "before_agent_start", {}, ctx), undefined);
+		const contextPatch = (await call(
+			handlers,
+			"context",
+			{ messages: [{ role: "custom", ...first.message }] },
+			ctx,
+		)) as { messages: unknown[] };
+		assert.deepEqual(contextPatch.messages, []);
+	});
+
+	it("expires each read independently after three subsequent user messages", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
+		temporaryDirectories.push(cwd);
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "first\nsecond\n");
+		const branch: unknown[] = [];
+		let report = "";
+		const { api, handlers, commands } = fakePi(branch);
+		workspaceLedgerExtension(api);
+		const ctx = {
+			cwd,
+			hasUI: true,
+			sessionManager: { getBranch: () => branch },
+			ui: { notify(value: string) { report = value; } },
+		};
+		await recordReadEvidence(handlers, ctx, branch, source, "read-full");
+		recordUserMessage(branch, "user-1");
+		recordUserMessage(branch, "user-2");
+		await recordReadEvidence(handlers, ctx, branch, source, "read-range", { offset: 2, limit: 1 });
+		await writeFile(source, "first\nchanged\n");
+		recordUserMessage(branch, "user-3");
+		recordUserMessage(branch, "user-4");
+
+		const active = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		const notice = String(active.messages.at(-1)?.content);
+		assert.match(notice, /read source\.ts lines 2-2/);
+		assert.doesNotMatch(notice, /^- STALE: "read source\.ts"$/m);
+
+		recordUserMessage(branch, "user-5");
+		const third = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(third.messages.at(-1)?.content), /STALE/);
+
+		recordUserMessage(branch, "user-6");
+		const expired = (await call(
+			handlers,
+			"context",
+			{ messages: [third.messages.at(-1)] },
+			ctx,
+		)) as { messages: unknown[] };
+		assert.deepEqual(expired.messages, []);
+		await commands.get("freshness")?.handler("", ctx);
+		assert.equal(report, "Workspace freshness: no evidence recorded.");
+	});
+
+	it("resets bounded reads on restore and branch changes but preserves reload", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
+		temporaryDirectories.push(cwd);
+		const source = join(cwd, "source.ts");
+		const resetEvents: Array<[string, string, Record<string, unknown>]> = [
+			["startup", "session_start", { reason: "startup" }],
+			["resume", "session_start", { reason: "resume" }],
+			["fork", "session_start", { reason: "fork" }],
+			["tree", "session_tree", { newLeafId: "new", oldLeafId: "old" }],
+		];
+
+		for (const [label, eventName, event] of resetEvents) {
+			await writeFile(source, "before\n");
+			const branch: unknown[] = [];
+			const { api, handlers } = fakePi(branch);
+			workspaceLedgerExtension(api);
+			const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+			await recordReadEvidence(handlers, ctx, branch, source);
+			await writeFile(source, "after\n");
+			await call(handlers, eventName, event, ctx);
+			assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined, label);
+		}
+
+		await writeFile(source, "before\n");
+		const branch: unknown[] = [];
+		const { api, handlers } = fakePi(branch);
+		workspaceLedgerExtension(api);
+		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+		await recordReadEvidence(handlers, ctx, branch, source);
+		await writeFile(source, "after\n");
+		await call(handlers, "session_start", { reason: "reload" }, ctx);
+		const reloadProjection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(reloadProjection.messages.at(-1)?.content), /STALE/);
+	});
+
+	it("keeps legacy unmarked evidence compatible across new epochs", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
+		temporaryDirectories.push(cwd);
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "before\n");
+		const branch: unknown[] = [];
+		const { api, handlers } = fakePi(branch);
+		workspaceLedgerExtension(api);
+		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+		const details = await recordReadEvidence(handlers, ctx, branch, source);
+		delete details[READ_DETAILS_KEY];
+		await writeFile(source, "after\n");
+		await call(handlers, "session_start", { reason: "resume" }, ctx);
+		for (let index = 1; index <= 4; index++) recordUserMessage(branch, `user-${index}`);
+
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
+	});
+
+	it("tracks logical workspace symlinks but ignores direct outside reads", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
+		temporaryDirectories.push(root);
+		const cwd = join(root, "workspace");
+		const firstTarget = join(root, "target-a");
+		const secondTarget = join(root, "target-b");
+		await Promise.all([mkdir(cwd), mkdir(firstTarget), mkdir(secondTarget)]);
+		await Promise.all([
+			writeFile(join(firstTarget, "source.ts"), "first\n"),
+			writeFile(join(secondTarget, "source.ts"), "second\n"),
+		]);
+		const link = join(cwd, "linked");
+		const linkType = process.platform === "win32" ? "junction" : "dir";
+		await symlink(firstTarget, link, linkType);
+		const source = join(link, "source.ts");
+		const branch: unknown[] = [];
+		const { api, handlers } = fakePi(branch);
+		workspaceLedgerExtension(api);
+		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+
+		const outsideInput = { path: join(firstTarget, "source.ts") };
+		await call(handlers, "tool_call", { toolName: "read", toolCallId: "outside", input: outsideInput }, ctx);
+		assert.equal(await call(
+			handlers,
+			"tool_result",
+			{ toolName: "read", toolCallId: "outside", input: outsideInput, details: {}, isError: false },
+			ctx,
+		), undefined);
+
+		const details = await recordReadEvidence(handlers, ctx, branch, source, "linked-read");
+		const envelope = details[FRESHNESS_DETAILS_KEY] as FreshnessEnvelopeV1;
+		assert.equal(envelope.evidence?.[0]?.dependencies[0]?.resource, pathToFileURL(source).href);
+		await unlink(link);
+		await symlink(secondTarget, link, linkType);
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
+	});
+
+	it("does not revive older evidence when a bounded successor expires", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
+		temporaryDirectories.push(cwd);
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "old\n");
+		const branch: unknown[] = [];
+		const { api, handlers } = fakePi(branch);
+		workspaceLedgerExtension(api);
+		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+		const legacy = await recordReadEvidence(handlers, ctx, branch, source, "legacy-read");
+		delete legacy[READ_DETAILS_KEY];
+		await writeFile(source, "new\n");
+		await recordReadEvidence(handlers, ctx, branch, source, "bounded-read");
+		for (let index = 1; index <= 4; index++) recordUserMessage(branch, `user-${index}`);
+
+		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
+	});
+
+	it("preserves similar tool output while removing marked legacy notices", async () => {
+		const branch: unknown[] = [];
+		const { api, handlers } = fakePi(branch);
+		workspaceLedgerExtension(api);
+		const ctx = { cwd: tmpdir(), hasUI: false, sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+		const message = {
+			role: "toolResult",
+			toolCallId: "other-tool",
+			toolName: "other",
+			content: [{ type: "text", text: "Workspace freshness (machine-generated status): legitimate output" }],
+			details: {},
+		};
+		assert.equal(await call(handlers, "context", { messages: [message] }, ctx), undefined);
+
+		const original = { type: "text", text: "original output" };
+		const legacyNotice = {
+			...message,
+			toolCallId: "legacy-tool",
+			content: [original, { type: "text", text: "Workspace freshness (machine-generated status):\n- STALE" }],
+			details: {
+				[NOTICE_DETAILS_KEY]: { version: 1, abnormalKey: "a".repeat(64) },
+			},
+		};
+		const filtered = (await call(handlers, "context", { messages: [legacyNotice] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.deepEqual(filtered.messages[0]?.content, [original]);
 	});
 });

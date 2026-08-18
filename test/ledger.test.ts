@@ -54,6 +54,20 @@ describe("LedgerState", () => {
 		);
 	});
 
+	it("retires evidence without reviving the superseded subject", () => {
+		const ledger = new LedgerState();
+		ledger.apply({ kind: "envelope", entryId: "legacy-read", envelope: readEnvelope() });
+		ledger.apply({
+			kind: "envelope",
+			entryId: "expired-read",
+			envelope: readEnvelope("read src/parser.ts", "sha-b"),
+			retiredEvidenceIndexes: [0],
+		});
+
+		assert.deepEqual(ledger.project(), []);
+		assert.equal(ledger.project({ includeSuperseded: true })[0]?.status, "superseded");
+	});
+
 	it("never treats dependencyless evidence as current", () => {
 		const ledger = new LedgerState();
 		ledger.apply({

@@ -10,7 +10,12 @@ export interface EvidenceView extends Evidence {
 }
 
 export type LedgerEvent =
-	| { kind: "envelope"; entryId: string; envelope: FreshnessEnvelopeV1 }
+	| {
+			kind: "envelope";
+			entryId: string;
+			envelope: FreshnessEnvelopeV1;
+			retiredEvidenceIndexes?: readonly number[];
+		}
 	| {
 			kind: "resolved";
 			resource: string;
@@ -57,8 +62,10 @@ export class LedgerState {
 		this.#appliedEntries.add(event.entryId);
 
 		for (const change of event.envelope.changes ?? []) this.applyChange(change);
+		const retired = new Set(event.retiredEvidenceIndexes);
 		for (const [index, evidence] of (event.envelope.evidence ?? []).entries()) {
-			this.addEvidence(event.entryId, index, evidence);
+			if (retired.has(index)) this.retireEvidence(event.entryId, evidence);
+			else this.addEvidence(event.entryId, index, evidence);
 		}
 		this.recompute();
 	}
@@ -73,15 +80,22 @@ export class LedgerState {
 			}));
 	}
 
-	private addEvidence(entryId: string, index: number, evidence: Evidence): void {
-		const previousId = this.#activeBySubject.get(evidence.subject);
-		if (previousId) {
-			const previous = this.#records.get(previousId);
-			if (previous) {
-				previous.status = "superseded";
-				previous.reasons = [`superseded by ${entryId}`];
-			}
+	private supersedeActive(subject: string, entryId: string): void {
+		const previousId = this.#activeBySubject.get(subject);
+		const previous = previousId ? this.#records.get(previousId) : undefined;
+		if (previous) {
+			previous.status = "superseded";
+			previous.reasons = [`superseded by ${entryId}`];
 		}
+	}
+
+	private retireEvidence(entryId: string, evidence: Evidence): void {
+		this.supersedeActive(evidence.subject, entryId);
+		this.#activeBySubject.delete(evidence.subject);
+	}
+
+	private addEvidence(entryId: string, index: number, evidence: Evidence): void {
+		this.supersedeActive(evidence.subject, entryId);
 
 		for (const dependency of evidence.dependencies) {
 			this.#resources.set(resourceKey(dependency.resource, dependency.facet, dependency.selector), {
