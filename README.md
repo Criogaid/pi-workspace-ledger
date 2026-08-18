@@ -8,22 +8,21 @@ The project generalizes the freshness principle behind hashline edits: a write s
 
 The initial vertical slice:
 
-- records exact whole-file content evidence for successful `read` calls on logical paths inside the current workspace when pre/post hashes match;
-- keeps each plugin-produced read active for the next three `role: user` session entries, independently of other reads;
-- starts a new read epoch after session restore, `/resume`, `/tree`, `/fork`, `/clone`, and every compaction;
-- preserves the current read epoch across `/reload`;
-- records file-content changes from successful `edit` and `write` calls;
-- reconstructs state from the current Pi session branch before projection;
+- records exact whole-file content evidence in the current extension runtime for successful `read` calls on logical paths inside the current workspace when pre/post hashes match;
+- keeps each recognized built-in read active for the next three live `role: user` messages, independently of other reads;
+- clears all freshness state on `/reload`, session start/resume, `/tree`, `/fork`, `/clone`, compaction, and shutdown;
+- records file-content changes from successful `edit` and `write` calls in memory;
+- never replays the Pi session branch or writes Envelope/notice metadata back to tool results or session entries;
 - streams SHA-256 over active dependencies and hashes a shared physical target once per projection;
 - detects out-of-band changes, including a workspace symlink being retargeted;
-- retains notice markers for session audit while filtering obsolete notices from model context;
+- injects only an ephemeral current notice at the model context boundary;
 - exposes `/freshness` for human inspection.
 
 The extension is passive. It does not block tools, skip tests, cache commands, add configuration modes, start file watchers, or add LLM calls. When no active evidence is stale or unverified, it adds no model-visible tokens.
 
 ## Read Lifetime
 
-The three-entry window applies only to reads produced by this extension after the bounded policy was introduced. Existing unmarked session evidence and third-party Envelope v1 producers retain their original lifecycle. Partial reads still depend on the whole file, and every persisted `role: user` entry counts toward the window. A read made while handling the current user entry does not consume that entry; it expires before the fourth subsequent user entry is projected.
+Freshness state exists only in the current extension instance. It is not restored from session JSONL, so restarting, resuming, forking, switching branches, compacting, or reloading always requires a new read. Historical tool outputs can remain in Pi's conversation log, but this extension neither validates nor projects them. Partial reads still depend on the whole file, and every live `role: user` message counts toward the window. A read made while handling the current user message does not consume that message; it expires before the fourth subsequent user message is projected.
 
 ## Development
 
@@ -55,7 +54,7 @@ Then restart or reload Pi and run:
 - `unverified`: dependency coverage is incomplete or cannot be resolved.
 - `superseded`: newer evidence replaced the same subject.
 
-Only currently active stale and unverified evidence is projected into model context. Opaque stamps, retention markers, and session entry/evidence IDs remain host-only.
+Only currently active stale and unverified evidence is projected into model context. Opaque stamps and runtime IDs remain in memory only.
 
 
 ## Project Policy
