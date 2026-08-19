@@ -149,8 +149,8 @@ export class LedgerState {
 	private recompute(): void {
 		for (const record of this.#records.values()) {
 			if (record.status === "superseded") continue;
-			const incompleteCoverage =
-				record.dependencies.length === 0 || record.assurance === "unverified";
+			const missingDependencies = record.dependencies.length === 0;
+			const producerUnverified = record.assurance === "unverified";
 
 			const staleReasons: string[] = [];
 			const unknownReasons: string[] = [];
@@ -168,10 +168,11 @@ export class LedgerState {
 			if (staleReasons.length > 0) {
 				record.status = "stale";
 				record.reasons = staleReasons;
-			} else if (incompleteCoverage || unknownReasons.length > 0) {
+			} else if (missingDependencies || producerUnverified || unknownReasons.length > 0) {
 				record.status = "unverified";
 				record.reasons = [
-					...(incompleteCoverage ? ["producer did not declare complete dependencies"] : []),
+					...(missingDependencies ? ["producer declared no dependencies"] : []),
+					...(producerUnverified ? ["producer marked evidence unverified"] : []),
 					...unknownReasons,
 				];
 			} else {

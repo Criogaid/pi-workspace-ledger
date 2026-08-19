@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -79,6 +79,12 @@ async function temporaryDirectory(): Promise<string> {
 
 function headlessContext(cwd: string) {
 	return { cwd, hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+}
+
+async function hashlineSnapshotId(path: string): Promise<string> {
+	const canonicalPath = await realpath(path);
+	const stats = await stat(canonicalPath);
+	return `v1|${canonicalPath}|${stats.mtimeMs}|${stats.size}`;
 }
 
 afterEach(async () => {
@@ -198,7 +204,7 @@ describe("Pi extension runtime freshness", () => {
 		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
 	});
 
-	it("keeps read overrides unverified when their output cannot be reproduced", async () => {
+	it("ignores unrecognized read overrides without producer evidence", async () => {
 		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		await writeFile(source, "local\n");
@@ -213,6 +219,61 @@ describe("Pi extension runtime freshness", () => {
 			input,
 			content: [{ type: "text", text: "remote\n" }],
 			details: {},
+			isError: false,
+		}, ctx);
+
+		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
+	});
+
+	it("tracks npm hashline reads conservatively", async () => {
+		const cwd = await temporaryDirectory();
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "local\n");
+		let report = "";
+		const { api, handlers, commands } = fakePi("npm:pi-hashline-edit@0.8.3");
+		workspaceLedgerExtension(api);
+		const ctx = {
+			...headlessContext(cwd),
+			hasUI: true,
+			ui: { notify(value: string) { report = value; } },
+		};
+		const input = { path: source };
+		await call(handlers, "tool_call", { toolName: "read", toolCallId: "hashline", input }, ctx);
+		await call(handlers, "tool_result", {
+			toolName: "read",
+			toolCallId: "hashline",
+			input,
+			content: [{ type: "text", text: "1#AA:local\n" }],
+			details: { snapshotId: await hashlineSnapshotId(source) },
+			isError: false,
+		}, ctx);
+
+		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
+		await commands.get("freshness")?.handler("", ctx);
+		assert.match(report, /current-conservative=1/);
+
+		await writeFile(source, "changed\n");
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
+	});
+
+	it("keeps hashline reads unverified when their snapshot cannot be matched", async () => {
+		const cwd = await temporaryDirectory();
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "local\n");
+		const { api, handlers } = fakePi("npm:pi-hashline-edit@0.8.3");
+		workspaceLedgerExtension(api);
+		const ctx = headlessContext(cwd);
+		const input = { path: source };
+		await call(handlers, "tool_call", { toolName: "read", toolCallId: "hashline-mismatch", input }, ctx);
+		await call(handlers, "tool_result", {
+			toolName: "read",
+			toolCallId: "hashline-mismatch",
+			input,
+			content: [{ type: "text", text: "1#AA:local\n" }],
+			details: { snapshotId: "v1|different|0|0" },
 			isError: false,
 		}, ctx);
 

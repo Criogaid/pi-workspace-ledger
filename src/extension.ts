@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { access, readFile, realpath } from "node:fs/promises";
+import { access, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -17,6 +17,7 @@ import { renderFreshnessNotice, renderFreshnessReport } from "./render.js";
 const SAFETY_MESSAGE_TYPE = "pi-workspace-ledger-safety-fallback";
 const READ_RETENTION_USER_MESSAGES = 3;
 const PNG_SIGNATURE = Buffer.from("89504e470d0a1a0a", "hex");
+const HASHLINE_READ_SOURCE = /^npm:pi-hashline-edit(?:@|$)/;
 
 interface PendingRead {
 	path: string;
@@ -24,6 +25,13 @@ interface PendingRead {
 	capturedStamp: string;
 	input: ReadToolInput;
 	content: unknown;
+	subject: string;
+}
+
+interface PendingHashlineRead {
+	path: string;
+	resource: string;
+	input: unknown;
 	subject: string;
 }
 
@@ -70,6 +78,14 @@ function fileResource(cwd: string, input: string): { path: string; resource: str
 	return { path, resource: pathToFileURL(path).href };
 }
 
+function activeReadSource(pi: ExtensionAPI): string | undefined {
+	return pi.getAllTools().find((tool) => tool.name === "read")?.sourceInfo.source;
+}
+
+function isHashlineReadSource(source: string | undefined): boolean {
+	return source !== undefined && HASHLINE_READ_SOURCE.test(source);
+}
+
 async function resolveFileStamp(path: string): Promise<FileHashResolution> {
 	try {
 		const hash = createHash("sha256");
@@ -89,6 +105,16 @@ async function canonicalHashPath(path: string): Promise<string> {
 		return await realpath(path);
 	} catch {
 		return path;
+	}
+}
+
+async function hashlineSnapshotId(path: string): Promise<string | undefined> {
+	try {
+		const canonicalPath = await canonicalHashPath(path);
+		const stats = await stat(canonicalPath);
+		return `v1|${canonicalPath}|${stats.mtimeMs}|${stats.size}`;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -163,6 +189,38 @@ async function captureBuiltinRead(
 	}
 }
 
+async function adaptHashlineRead(
+	pending: PendingHashlineRead,
+	input: unknown,
+	details: unknown,
+): Promise<FreshnessEnvelopeV1> {
+	const reportedSnapshot = isRecord(details) && typeof details.snapshotId === "string"
+		? details.snapshotId
+		: undefined;
+	let stamp: string | null = null;
+
+	if (reportedSnapshot && isDeepStrictEqual(input, pending.input)) {
+		const before = await hashlineSnapshotId(pending.path);
+		if (before === reportedSnapshot) {
+			const candidate = await hashFile(pending.path);
+			const after = await hashlineSnapshotId(pending.path);
+			// snapshotId 只有路径、mtime 和大小；前后夹住内容哈希仍只能保守证明。
+			if (candidate && after === before) stamp = candidate;
+		}
+	}
+
+	return {
+		version: 1,
+		evidence: [
+			{
+				subject: pending.subject,
+				dependencies: stamp ? [{ resource: pending.resource, facet: "content", stamp }] : [],
+				assurance: stamp ? "conservative" : "unverified",
+			},
+		],
+	};
+}
+
 async function refreshFileEvidence(state: LedgerState): Promise<void> {
 	const dependencies = new Map<string, { resource: string; selector?: JsonValue }>();
 	for (const evidence of state.project()) {
@@ -233,11 +291,13 @@ async function projectFreshness(
 
 export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 	const pendingReads = new Map<string, PendingRead>();
+	const pendingHashlineReads = new Map<string, PendingHashlineRead>();
 	const runtimeEvents: RuntimeEnvelope[] = [];
 	let userMessageIndex = 0;
 
 	const resetRuntime = () => {
 		pendingReads.clear();
+		pendingHashlineReads.clear();
 		runtimeEvents.length = 0;
 		userMessageIndex = 0;
 	};
@@ -253,8 +313,23 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "read") return;
 
-		const pending = await captureBuiltinRead(event.toolCallId, event.input as ReadToolInput, ctx);
-		if (pending) pendingReads.set(event.toolCallId, pending);
+		const source = activeReadSource(pi);
+		if (source === "builtin") {
+			const pending = await captureBuiltinRead(event.toolCallId, event.input as ReadToolInput, ctx);
+			if (pending) pendingReads.set(event.toolCallId, pending);
+			return;
+		}
+
+		if (!isHashlineReadSource(source)) return;
+		const requestedPath = inputPath(event.input);
+		if (!requestedPath) return;
+		const file = fileResource(ctx.cwd, requestedPath);
+		if (!isWorkspacePath(ctx.cwd, file.path)) return;
+		pendingHashlineReads.set(event.toolCallId, {
+			...file,
+			input: structuredClone(event.input),
+			subject: readSubject(ctx.cwd, file.path),
+		});
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -264,26 +339,32 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 
 		if (event.toolName === "read") {
 			const pending = pendingReads.get(event.toolCallId);
+			const pendingHashline = pendingHashlineReads.get(event.toolCallId);
 			pendingReads.delete(event.toolCallId);
-			if (!event.isError && pending) {
-				const afterStamp = await hashFile(pending.path);
-				const exact =
-					afterStamp === pending.capturedStamp &&
-					isDeepStrictEqual(event.input, pending.input) &&
-					isDeepStrictEqual(event.content, pending.content);
-				adapted = {
-					version: 1,
-					evidence: [
-						{
-							subject: pending.subject,
-							dependencies: afterStamp
-								? [{ resource: pending.resource, facet: "content", stamp: afterStamp }]
-								: [],
-							assurance: exact ? "exact" : "unverified",
-						},
-					],
-				};
-				readEvidenceIndex = existing?.evidence?.length ?? 0;
+			pendingHashlineReads.delete(event.toolCallId);
+			if (!event.isError && (existing?.evidence?.length ?? 0) === 0) {
+				if (pending) {
+					const afterStamp = await hashFile(pending.path);
+					const exact =
+						afterStamp === pending.capturedStamp &&
+						isDeepStrictEqual(event.input, pending.input) &&
+						isDeepStrictEqual(event.content, pending.content);
+					adapted = {
+						version: 1,
+						evidence: [
+							{
+								subject: pending.subject,
+								dependencies: afterStamp
+									? [{ resource: pending.resource, facet: "content", stamp: afterStamp }]
+									: [],
+								assurance: exact ? "exact" : "unverified",
+							},
+						],
+					};
+				} else if (pendingHashline) {
+					adapted = await adaptHashlineRead(pendingHashline, event.input, event.details);
+				}
+				if (adapted) readEvidenceIndex = existing?.evidence?.length ?? 0;
 			}
 		} else if (!event.isError && (event.toolName === "edit" || event.toolName === "write")) {
 			const requestedPath = inputPath(event.input);

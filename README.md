@@ -9,17 +9,20 @@ The extension is deliberately narrow: it tracks active evidence and independentl
 ## How It Works
 
 ```text
-local built-in read -> captured file snapshot -> runtime evidence
-edit / write        -> content change        -> runtime evidence
-live Envelope v1    -> producer evidence      -> runtime evidence
-                                               |
-before model context or /freshness <----------+
+local built-in read  -> captured file snapshot  -> exact runtime evidence
+recognized hashline -> snapshot/SHA-256 handshake -> conservative runtime evidence
+edit / write         -> content change          -> runtime evidence
+live Envelope v1     -> producer evidence        -> runtime evidence
+                                                   |
+before model context or /freshness <--------------+
                  |
                  +-> re-hash active file dependencies
                  +-> inject a notice only for stale or unverified evidence
 ```
 
 For an eligible built-in `read`, the extension uses Pi's read implementation to capture the resolved path, tool-result content, and SHA-256 stamp from the same file buffer. The result is `exact` only when the executed tool input and output match that capture and the file still has the captured stamp.
+
+For the npm `pi-hashline-edit` override, the extension validates its existing `snapshotId` before and after hashing the current file. Because that snapshot contains path, mtime, and size rather than the bytes used to render the result, successful evidence is deliberately `conservative`, not `exact`.
 
 Before each model request, supported active file dependencies are resolved again and all active evidence is reprojected. When no evidence is stale or unverified, the extension adds no model-visible tokens. Otherwise it renders one ephemeral `role: custom` status message.
 
@@ -29,12 +32,13 @@ Before each model request, supported active file dependencies are resolved again
 | --- | --- |
 | Local built-in `read` on a logical path inside the workspace | Captures exact content evidence when input, output, and source stamp all match. |
 | Partial built-in `read` | Tracks the selected observation, but depends on the whole file. |
-| Supported image `read` | Uses the same captured-buffer and output comparison as text reads. |
-| Overridden, SDK, or remote `read` | Does not receive built-in read evidence automatically. It may provide an Envelope v1 result. |
+| Supported built-in image `read` | Uses the same captured-buffer and output comparison as text reads. |
+| npm `pi-hashline-edit` `read` inside the workspace | Uses its `snapshotId` to bind a current SHA-256 stamp conservatively; snapshot mismatch remains unverified. |
+| Other overridden, SDK, or remote `read` | Does not receive adapted read evidence automatically. It may provide an Envelope v1 result. |
 | Successful result from a tool named `edit` or `write` with a string `input.path` | Treats the supplied path as a local content change, resolving relative paths against the current working directory. |
 | Other live tool results | Consumes a valid Envelope v1 from tool-result `details`. |
 
-Direct built-in reads outside the workspace are ignored. A logical path inside the workspace remains tracked when it is a symlink to an outside target; retargeting that symlink is detected when the resulting content stamp changes.
+Direct adapted reads outside the workspace are ignored. A logical path inside the workspace remains tracked when it is a symlink to an outside target; retargeting that symlink is detected when the resulting content stamp changes.
 
 ## Install and Use
 
@@ -56,7 +60,7 @@ Use the extension normally; freshness checks happen automatically before model r
 
 ## Evidence Lifetime
 
-- The latest adapted built-in read for each file stays active through the next three live `role: user` messages and expires before the fourth subsequent message is projected.
+- The latest adapted built-in or recognized hashline read for each file stays active through the next three live `role: user` messages and expires before the fourth subsequent message is projected.
 - A read made while handling the current user message does not consume that message's lifetime.
 - Reads of different files expire independently; a newer read of the same file supersedes the older evidence.
 - Envelope-provided evidence has no message-count expiry; it remains until superseded or the runtime is reset.
@@ -72,7 +76,7 @@ Use the extension normally; freshness checks happen automatically before model r
 | `current` | No tracked contradiction exists, and every dependency covered by a built-in resolver currently matches. |
 | `current-conservative` | The same condition as `current`, but the producer classified coverage as conservative. |
 | `stale` | At least one dependency changed, disappeared, or has a different stamp. |
-| `unverified` | The producer declared incomplete coverage, supplied no dependencies, or a supported resolver could not resolve a dependency. |
+| `unverified` | Evidence has no dependencies, the producer marked it unverified, or a supported resolver could not resolve a dependency. |
 | `superseded` | Newer evidence replaced the same subject. Normal projection hides this status. |
 
 Only active `stale` and `unverified` evidence is injected into model context. `/freshness` reports all normally projected active evidence, including current records. Opaque stamps and runtime IDs remain in memory.

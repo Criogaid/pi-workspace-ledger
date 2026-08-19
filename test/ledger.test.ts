@@ -80,6 +80,27 @@ describe("LedgerState", () => {
 		});
 
 		assert.equal(ledger.project()[0]?.status, "unverified");
+		assert.deepEqual(ledger.project()[0]?.reasons, ["producer declared no dependencies"]);
+	});
+
+	it("distinguishes producer-declared unverified evidence", () => {
+		const ledger = new LedgerState();
+		ledger.apply({
+			kind: "envelope",
+			entryId: "partial",
+			envelope: {
+				version: 1,
+				evidence: [
+					{
+						subject: "partial read",
+						dependencies: [{ resource: FILE, facet: "content", stamp: "sha-a" }],
+						assurance: "unverified",
+					},
+				],
+			},
+		});
+
+		assert.deepEqual(ledger.project()[0]?.reasons, ["producer marked evidence unverified"]);
 	});
 
 	it("applies a persisted entry only once", () => {
