@@ -1,26 +1,28 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { access, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isDeepStrictEqual } from "node:util";
+import {
+	createReadToolDefinition,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ReadToolInput,
+} from "@earendil-works/pi-coding-agent";
 import { envelopeFromDetails, mergeEnvelopes, type FreshnessEnvelopeV1, type JsonValue } from "./envelope.js";
 import { LedgerState, type EvidenceView } from "./ledger.js";
-import {
-	FRESHNESS_NOTICE_HEADER,
-	renderFreshnessNotice,
-	renderFreshnessReport,
-} from "./render.js";
+import { renderFreshnessNotice, renderFreshnessReport } from "./render.js";
 
-const NOTICE_DETAILS_KEY = "pi-workspace-ledger/notice";
-const NOTICE_MESSAGE_TYPE = "pi-workspace-ledger-notice";
 const SAFETY_MESSAGE_TYPE = "pi-workspace-ledger-safety-fallback";
 const READ_RETENTION_USER_MESSAGES = 3;
 
 interface PendingRead {
 	path: string;
 	resource: string;
-	beforeStamp: string | null;
+	beforeStamp: string;
+	input: ReadToolInput;
+	content: unknown;
 	subject: string;
 }
 
@@ -33,12 +35,6 @@ interface RuntimeEnvelope {
 	entryId: string;
 	envelope: FreshnessEnvelopeV1;
 	readRetention?: RuntimeReadRetention;
-}
-
-interface NoticeMarker {
-	version: 1;
-	abnormalKey: string | null;
-	projectionOnly?: true;
 }
 
 interface FreshnessProjection {
@@ -111,30 +107,67 @@ function readSubject(cwd: string, path: string, input: unknown): string {
 	return `${base} lines ${start}-${start + limit - 1}`;
 }
 
-function noticeMarker(value: unknown): NoticeMarker | undefined {
-	if (!isRecord(value) || value.version !== 1) return undefined;
-	if (value.abnormalKey !== null && (typeof value.abnormalKey !== "string" || !/^[0-9a-f]{64}$/.test(value.abnormalKey))) {
+// ponytail: 异常 PNG/BMP 可能降为 unverified；Pi 导出 MIME detector 后直接复用。
+function detectBuiltinImageMimeType(buffer: Buffer): string | null {
+	if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff && buffer[3] !== 0xf7) {
+		return "image/jpeg";
+	}
+	if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+		return "image/png";
+	}
+	if (buffer.toString("ascii", 0, 3) === "GIF") return "image/gif";
+	if (buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
+		return "image/webp";
+	}
+	if (buffer.toString("ascii", 0, 2) === "BM") return "image/bmp";
+	return null;
+}
+
+async function captureBuiltinRead(
+	toolCallId: string,
+	input: ReadToolInput,
+	ctx: ExtensionContext,
+): Promise<PendingRead | undefined> {
+	const { cwd, signal } = ctx;
+	let file: ReturnType<typeof fileResource> | undefined;
+	let captured: { path: string; buffer: Buffer } | undefined;
+	let beforeStamp: string | undefined;
+	const load = async (path: string): Promise<Buffer> => {
+		if (captured?.path === path) return captured.buffer;
+		const buffer = await readFile(path);
+		captured = { path, buffer };
+		beforeStamp = createHash("sha256").update(buffer).digest("hex");
+		return buffer;
+	};
+
+	try {
+		// 复用 Pi 的 read 解析和输出规则，并把 stamp 绑定到同一次文件读取。
+		const read = createReadToolDefinition(cwd, {
+			operations: {
+				async access(path) {
+					const candidate = fileResource(cwd, path);
+					if (!isWorkspacePath(cwd, candidate.path)) throw new Error("outside workspace");
+					await access(path);
+					file = candidate;
+				},
+				readFile: load,
+				async detectImageMimeType(path) {
+					return detectBuiltinImageMimeType(await load(path));
+				},
+			},
+		});
+		const result = await read.execute(toolCallId, input, signal, undefined, ctx);
+		if (!file || !beforeStamp) return undefined;
+		return {
+			...file,
+			beforeStamp,
+			input: structuredClone(input),
+			content: result.content,
+			subject: readSubject(cwd, file.path, input),
+		};
+	} catch {
 		return undefined;
 	}
-	if (value.projectionOnly !== undefined && value.projectionOnly !== true) return undefined;
-	return {
-		version: 1,
-		abnormalKey: value.abnormalKey,
-		...(value.projectionOnly === true ? { projectionOnly: true } : {}),
-	};
-}
-
-function noticeFromDetails(details: unknown): NoticeMarker | undefined {
-	return isRecord(details) ? noticeMarker(details[NOTICE_DETAILS_KEY]) : undefined;
-}
-
-function isFreshnessNoticePart(value: unknown): boolean {
-	return (
-		isRecord(value) &&
-		value.type === "text" &&
-		typeof value.text === "string" &&
-		value.text.startsWith(FRESHNESS_NOTICE_HEADER)
-	);
 }
 
 async function refreshFileEvidence(state: LedgerState): Promise<void> {
@@ -226,17 +259,11 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "read") return;
-		const requestedPath = inputPath(event.input);
-		if (!requestedPath) return;
-		const file = fileResource(ctx.cwd, requestedPath);
-		if (!isWorkspacePath(ctx.cwd, file.path)) return;
+		const readTool = pi.getAllTools().find((tool) => tool.name === "read");
+		if (readTool?.sourceInfo.source !== "builtin") return;
 
-		// 调用前后 hash 一致时，evidence 才绑定到工具实际读取期间的稳定内容。
-		pendingReads.set(event.toolCallId, {
-			...file,
-			beforeStamp: await hashFile(file.path),
-			subject: readSubject(ctx.cwd, file.path, event.input),
-		});
+		const pending = await captureBuiltinRead(event.toolCallId, event.input as ReadToolInput, ctx);
+		if (pending) pendingReads.set(event.toolCallId, pending);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -249,7 +276,11 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 			pendingReads.delete(event.toolCallId);
 			if (!event.isError && pending) {
 				const afterStamp = await hashFile(pending.path);
-				const stable = afterStamp !== null && afterStamp === pending.beforeStamp;
+				const stable =
+					afterStamp !== null &&
+					afterStamp === pending.beforeStamp &&
+					isDeepStrictEqual(event.input, pending.input) &&
+					isDeepStrictEqual(event.content, pending.content);
 				adapted = {
 					version: 1,
 					evidence: [
@@ -288,41 +319,23 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 
 	pi.on("context", async (event) => {
 		const projection = await projectFreshness(runtimeEvents, userMessageIndex);
-		let filtered = false;
-		const messages: typeof event.messages = [];
-		for (const message of event.messages) {
-			if (
-				message.role === "custom" &&
-				(message.customType === NOTICE_MESSAGE_TYPE || message.customType === SAFETY_MESSAGE_TYPE)
-			) {
-				filtered = true;
-				continue;
-			}
-			if (message.role !== "toolResult") {
-				messages.push(message);
-				continue;
-			}
-			const marker = noticeFromDetails(message.details);
-			const lastPart = message.content.at(-1);
-			const hasLegacyInlineNotice =
-				marker !== undefined && marker.projectionOnly !== true && isFreshnessNoticePart(lastPart);
-			if (hasLegacyInlineNotice) filtered = true;
-			messages.push(
-				hasLegacyInlineNotice ? { ...message, content: message.content.slice(0, -1) } : message,
-			);
+		const messages = event.messages.filter(
+			(message) => message.role !== "custom" || message.customType !== SAFETY_MESSAGE_TYPE,
+		);
+
+		if (!projection.noticeText) {
+			if (messages.length !== event.messages.length) return { messages };
+			return;
 		}
 
-		if (projection.noticeText) {
-			const message = {
-				role: "custom",
-				customType: SAFETY_MESSAGE_TYPE,
-				content: projection.noticeText,
-				display: false,
-				timestamp: Date.now(),
-			} satisfies (typeof event.messages)[number];
-			return { messages: [...messages, message] };
-		}
-		if (filtered) return { messages };
+		const message = {
+			role: "custom",
+			customType: SAFETY_MESSAGE_TYPE,
+			content: projection.noticeText,
+			display: false,
+			timestamp: Date.now(),
+		} satisfies (typeof event.messages)[number];
+		return { messages: [...messages, message] };
 	});
 
 	pi.registerCommand("freshness", {

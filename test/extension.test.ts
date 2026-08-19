@@ -4,15 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createReadToolDefinition, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FRESHNESS_DETAILS_KEY } from "../src/envelope.js";
 import workspaceLedgerExtension from "../src/extension.js";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
-const NOTICE_DETAILS_KEY = "pi-workspace-ledger/notice";
-
-function fakePi() {
+function fakePi(readSource = "builtin") {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, { handler: Handler }>();
 	const customEntries: Array<{ customType: string; data: unknown }> = [];
@@ -25,6 +23,9 @@ function fakePi() {
 		},
 		appendEntry(customType: string, data: unknown) {
 			customEntries.push({ customType, data });
+		},
+		getAllTools() {
+			return [{ name: "read", sourceInfo: { source: readSource } }];
 		},
 	} as unknown as ExtensionAPI;
 
@@ -44,7 +45,7 @@ async function call(
 
 async function recordReadEvidence(
 	handlers: Map<string, Handler[]>,
-	ctx: unknown,
+	ctx: any,
 	path: string,
 	toolCallId = "read-1",
 	options: { offset?: number; limit?: number } = {},
@@ -52,11 +53,18 @@ async function recordReadEvidence(
 ): Promise<void> {
 	const input = { path, ...options };
 	await call(handlers, "tool_call", { toolName: "read", toolCallId, input }, ctx);
+	const result = await createReadToolDefinition(ctx.cwd).execute(
+		toolCallId,
+		input,
+		undefined,
+		undefined,
+		ctx,
+	);
 	assert.equal(
 		await call(
 			handlers,
 			"tool_result",
-			{ toolName: "read", toolCallId, input, details, isError: false },
+			{ toolName: "read", toolCallId, input, content: result.content, details, isError: false },
 			ctx,
 		),
 		undefined,
@@ -109,9 +117,11 @@ describe("Pi extension runtime freshness", () => {
 			),
 			undefined,
 		);
-		const contextPatch = (await call(handlers, "context", { messages: [] }, ctx)) as {
+		const messages = [{ role: "user", content: "current prompt" }];
+		const contextPatch = (await call(handlers, "context", { messages }, ctx)) as {
 			messages: Array<{ content: unknown }>;
 		};
+		assert.deepEqual(contextPatch.messages.slice(0, -1), messages);
 		assert.match(String(contextPatch.messages.at(-1)?.content), /read source\.ts lines 2-4/);
 		assert.match(String(contextPatch.messages.at(-1)?.content), /STALE/);
 		assert.deepEqual(customEntries, []);
@@ -133,6 +143,96 @@ describe("Pi extension runtime freshness", () => {
 			messages: Array<{ content: unknown }>;
 		};
 		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
+	});
+
+	it("does not bind exact evidence across an A-B-A read", async () => {
+		const cwd = await temporaryDirectory();
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "A\n");
+		const { api, handlers } = fakePi();
+		workspaceLedgerExtension(api);
+		const ctx = headlessContext(cwd);
+		const input = { path: source };
+
+		await call(handlers, "tool_call", { toolName: "read", toolCallId: "aba", input }, ctx);
+		await writeFile(source, "B\n");
+		const result = await createReadToolDefinition(cwd).execute("aba", input, undefined, undefined, ctx as any);
+		await writeFile(source, "A\n");
+		await call(handlers, "tool_result", {
+			toolName: "read",
+			toolCallId: "aba",
+			input,
+			content: result.content,
+			details: result.details,
+			isError: false,
+		}, ctx);
+
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /UNVERIFIED/);
+	});
+
+	it("tracks the path resolved by the built-in read", async () => {
+		const cwd = await temporaryDirectory();
+		const source = join(cwd, "source.ts");
+		await Promise.all([writeFile(source, "actual\n"), writeFile(join(cwd, "@source.ts"), "decoy\n")]);
+		const { api, handlers } = fakePi();
+		workspaceLedgerExtension(api);
+		const ctx = headlessContext(cwd);
+		await recordReadEvidence(handlers, ctx, "@source.ts", "normalized-path");
+		await writeFile(source, "changed\n");
+
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
+	});
+
+	it("ignores read overrides instead of tracking a local namesake", async () => {
+		const cwd = await temporaryDirectory();
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "local\n");
+		const { api, handlers } = fakePi("extension");
+		workspaceLedgerExtension(api);
+		const ctx = headlessContext(cwd);
+		const input = { path: source };
+		await call(handlers, "tool_call", { toolName: "read", toolCallId: "override", input }, ctx);
+		await call(handlers, "tool_result", {
+			toolName: "read",
+			toolCallId: "override",
+			input,
+			content: [{ type: "text", text: "remote\n" }],
+			details: {},
+			isError: false,
+		}, ctx);
+		await writeFile(source, "changed locally\n");
+
+		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
+	});
+
+	it("keeps supported image reads exact", async () => {
+		const cwd = await temporaryDirectory();
+		const image = join(cwd, "pixel.png");
+		await writeFile(
+			image,
+			Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+				"base64",
+			),
+		);
+		let report = "";
+		const { api, handlers, commands } = fakePi();
+		workspaceLedgerExtension(api);
+		const ctx = {
+			...headlessContext(cwd),
+			hasUI: true,
+			ui: { notify(value: string) { report = value; } },
+		};
+		await recordReadEvidence(handlers, ctx, image, "image");
+		await commands.get("freshness")?.handler("", ctx);
+		assert.match(report, /current=1/);
+		assert.doesNotMatch(report, /unverified=/);
 	});
 
 	it("keeps third-party selector evidence unverified in the current runtime", async () => {
@@ -192,12 +292,6 @@ describe("Pi extension runtime freshness", () => {
 				},
 			},
 		};
-		const historicalNotice = {
-			role: "custom",
-			customType: "pi-workspace-ledger-safety-fallback",
-			content: "Workspace freshness (machine-generated status): historical",
-			display: false,
-		};
 		const { api, handlers, customEntries } = fakePi();
 		workspaceLedgerExtension(api);
 		const ctx = {
@@ -207,13 +301,10 @@ describe("Pi extension runtime freshness", () => {
 			ui: { notify() {} },
 		};
 
-		const filtered = (await call(
-			handlers,
-			"context",
-			{ messages: [oldToolResult, historicalNotice] },
-			ctx,
-		)) as { messages: unknown[] };
-		assert.deepEqual(filtered.messages, [oldToolResult]);
+		assert.equal(
+			await call(handlers, "context", { messages: [oldToolResult] }, ctx),
+			undefined,
+		);
 		assert.deepEqual(customEntries, []);
 	});
 
@@ -344,31 +435,5 @@ describe("Pi extension runtime freshness", () => {
 			messages: Array<{ content: unknown }>;
 		};
 		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
-	});
-
-	it("preserves similar tool output while removing marked legacy notices", async () => {
-		const { api, handlers } = fakePi();
-		workspaceLedgerExtension(api);
-		const ctx = headlessContext(tmpdir());
-		const message = {
-			role: "toolResult",
-			toolCallId: "other-tool",
-			toolName: "other",
-			content: [{ type: "text", text: "Workspace freshness (machine-generated status): legitimate output" }],
-			details: {},
-		};
-		assert.equal(await call(handlers, "context", { messages: [message] }, ctx), undefined);
-
-		const original = { type: "text", text: "original output" };
-		const legacyNotice = {
-			...message,
-			toolCallId: "legacy-tool",
-			content: [original, { type: "text", text: "Workspace freshness (machine-generated status):\n- STALE" }],
-			details: { [NOTICE_DETAILS_KEY]: { version: 1, abnormalKey: "a".repeat(64) } },
-		};
-		const filtered = (await call(handlers, "context", { messages: [legacyNotice] }, ctx)) as {
-			messages: Array<{ content: unknown }>;
-		};
-		assert.deepEqual(filtered.messages[0]?.content, [original]);
 	});
 });

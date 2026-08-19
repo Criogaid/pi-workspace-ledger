@@ -8,7 +8,7 @@ The project generalizes the freshness principle behind hashline edits: a write s
 
 The initial vertical slice:
 
-- records exact whole-file content evidence in the current extension runtime for successful `read` calls on logical paths inside the current workspace when pre/post hashes match;
+- records exact whole-file content evidence in the current extension runtime only when a local built-in `read` result matches the captured input and output and the observed source hash still matches;
 - keeps each recognized built-in read active for the next three live `role: user` messages, independently of other reads;
 - clears all freshness state on `/reload`, session start/resume, `/tree`, `/fork`, `/clone`, compaction, and shutdown;
 - records file-content changes from successful `edit` and `write` calls in memory;
