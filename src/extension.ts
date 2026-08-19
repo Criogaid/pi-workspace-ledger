@@ -191,15 +191,21 @@ async function captureBuiltinRead(
 
 async function adaptHashlineRead(
 	pending: PendingHashlineRead,
+	toolCallId: string,
 	input: unknown,
+	content: unknown,
 	details: unknown,
+	ctx: ExtensionContext,
 ): Promise<FreshnessEnvelopeV1> {
 	const reportedSnapshot = isRecord(details) && typeof details.snapshotId === "string"
 		? details.snapshotId
 		: undefined;
+	const sameInput = isDeepStrictEqual(input, pending.input);
+	let resource = pending.resource;
+	let subject = pending.subject;
 	let stamp: string | null = null;
 
-	if (reportedSnapshot && isDeepStrictEqual(input, pending.input)) {
+	if (reportedSnapshot && sameInput) {
 		const before = await hashlineSnapshotId(pending.path);
 		if (before === reportedSnapshot) {
 			const candidate = await hashFile(pending.path);
@@ -207,14 +213,25 @@ async function adaptHashlineRead(
 			// snapshotId 只有路径、mtime 和大小；前后夹住内容哈希仍只能保守证明。
 			if (candidate && after === before) stamp = candidate;
 		}
+	} else if (!reportedSnapshot && sameInput) {
+		const replay = await captureBuiltinRead(toolCallId, input as ReadToolInput, ctx);
+		if (replay) {
+			const afterStamp = await hashFile(replay.path);
+			// 图片分支没有 snapshotId；重放只能证明当前结果可复现，不能升级为 exact。
+			if (afterStamp === replay.capturedStamp && isDeepStrictEqual(content, replay.content)) {
+				resource = replay.resource;
+				subject = replay.subject;
+				stamp = afterStamp;
+			}
+		}
 	}
 
 	return {
 		version: 1,
 		evidence: [
 			{
-				subject: pending.subject,
-				dependencies: stamp ? [{ resource: pending.resource, facet: "content", stamp }] : [],
+				subject,
+				dependencies: stamp ? [{ resource, facet: "content", stamp }] : [],
 				assurance: stamp ? "conservative" : "unverified",
 			},
 		],
@@ -362,7 +379,14 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 						],
 					};
 				} else if (pendingHashline) {
-					adapted = await adaptHashlineRead(pendingHashline, event.input, event.details);
+					adapted = await adaptHashlineRead(
+						pendingHashline,
+						event.toolCallId,
+						event.input,
+						event.content,
+						event.details,
+						ctx,
+					);
 				}
 				if (adapted) readEvidenceIndex = existing?.evidence?.length ?? 0;
 			}

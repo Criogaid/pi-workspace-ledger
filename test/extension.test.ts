@@ -10,6 +10,11 @@ import workspaceLedgerExtension from "../src/extension.js";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
+const PIXEL_PNG = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	"base64",
+);
+
 function fakePi(readSource = "builtin") {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, { handler: Handler }>();
@@ -259,6 +264,46 @@ describe("Pi extension runtime freshness", () => {
 		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
 	});
 
+	it("tracks hashline image reads conservatively through the built-in fallback", async () => {
+		const cwd = await temporaryDirectory();
+		const image = join(cwd, "pixel.png");
+		await writeFile(image, PIXEL_PNG);
+		let report = "";
+		const { api, handlers, commands } = fakePi("npm:pi-hashline-edit@0.8.3");
+		workspaceLedgerExtension(api);
+		const ctx = {
+			...headlessContext(cwd),
+			hasUI: true,
+			ui: { notify(value: string) { report = value; } },
+		};
+		const input = { path: image };
+		await call(handlers, "tool_call", { toolName: "read", toolCallId: "hashline-image", input }, ctx);
+		const result = await createReadToolDefinition(cwd).execute(
+			"hashline-image",
+			input,
+			undefined,
+			undefined,
+			ctx as any,
+		);
+		await call(handlers, "tool_result", {
+			toolName: "read",
+			toolCallId: "hashline-image",
+			input,
+			content: result.content,
+			details: result.details,
+			isError: false,
+		}, ctx);
+
+		await commands.get("freshness")?.handler("", ctx);
+		assert.match(report, /current-conservative=1/);
+
+		await writeFile(image, Buffer.from("changed"));
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
+	});
+
 	it("keeps hashline reads unverified when their snapshot cannot be matched", async () => {
 		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
@@ -283,16 +328,34 @@ describe("Pi extension runtime freshness", () => {
 		assert.match(String(projection.messages.at(-1)?.content), /UNVERIFIED/);
 	});
 
+	it("keeps unreproducible hashline results without a snapshot unverified", async () => {
+		const cwd = await temporaryDirectory();
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "local\n");
+		const { api, handlers } = fakePi("npm:pi-hashline-edit@0.8.3");
+		workspaceLedgerExtension(api);
+		const ctx = headlessContext(cwd);
+		const input = { path: source };
+		await call(handlers, "tool_call", { toolName: "read", toolCallId: "hashline-no-snapshot", input }, ctx);
+		await call(handlers, "tool_result", {
+			toolName: "read",
+			toolCallId: "hashline-no-snapshot",
+			input,
+			content: [{ type: "text", text: "not the file" }],
+			details: {},
+			isError: false,
+		}, ctx);
+
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /UNVERIFIED/);
+	});
+
 	it("keeps supported image reads exact", async () => {
 		const cwd = await temporaryDirectory();
 		const image = join(cwd, "pixel.png");
-		await writeFile(
-			image,
-			Buffer.from(
-				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-				"base64",
-			),
-		);
+		await writeFile(image, PIXEL_PNG);
 		let report = "";
 		const { api, handlers, commands } = fakePi();
 		workspaceLedgerExtension(api);

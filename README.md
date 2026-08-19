@@ -22,7 +22,7 @@ before model context or /freshness <--------------+
 
 For an eligible built-in `read`, the extension uses Pi's read implementation to capture the resolved path, tool-result content, and SHA-256 stamp from the same file buffer. The result is `exact` only when the executed tool input and output match that capture and the file still has the captured stamp.
 
-For the npm `pi-hashline-edit` override, the extension validates its existing `snapshotId` before and after hashing the current file. Because that snapshot contains path, mtime, and size rather than the bytes used to render the result, successful evidence is deliberately `conservative`, not `exact`.
+For the npm `pi-hashline-edit` override, the extension validates its existing `snapshotId` before and after hashing the current file. Its delegated image reads omit that snapshot, so the extension accepts them only when Pi's built-in read can reproduce the complete result from the current file. Both paths are deliberately `conservative`, not `exact`, because neither uses the producer's original buffer.
 
 Before each model request, supported active file dependencies are resolved again and all active evidence is reprojected. When no evidence is stale or unverified, the extension adds no model-visible tokens. Otherwise it renders one ephemeral `role: custom` status message.
 
@@ -33,7 +33,7 @@ Before each model request, supported active file dependencies are resolved again
 | Local built-in `read` on a logical path inside the workspace | Captures exact content evidence when input, output, and source stamp all match. |
 | Partial built-in `read` | Tracks the selected observation, but depends on the whole file. |
 | Supported built-in image `read` | Uses the same captured-buffer and output comparison as text reads. |
-| npm `pi-hashline-edit` `read` inside the workspace | Uses its `snapshotId` to bind a current SHA-256 stamp conservatively; snapshot mismatch remains unverified. |
+| npm `pi-hashline-edit` `read` inside the workspace | Uses its `snapshotId`, or full built-in output replay for delegated images, to bind a current SHA-256 stamp conservatively; mismatches remain unverified. |
 | Other overridden, SDK, or remote `read` | Does not receive adapted read evidence automatically. It may provide an Envelope v1 result. |
 | Successful result from a tool named `edit` or `write` with a string `input.path` | Treats the supplied path as a local content change, resolving relative paths against the current working directory. |
 | Other live tool results | Consumes a valid Envelope v1 from tool-result `details`. |
