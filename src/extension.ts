@@ -16,11 +16,12 @@ import { renderFreshnessNotice, renderFreshnessReport } from "./render.js";
 
 const SAFETY_MESSAGE_TYPE = "pi-workspace-ledger-safety-fallback";
 const READ_RETENTION_USER_MESSAGES = 3;
+const PNG_SIGNATURE = Buffer.from("89504e470d0a1a0a", "hex");
 
 interface PendingRead {
 	path: string;
 	resource: string;
-	beforeStamp: string;
+	capturedStamp: string;
 	input: ReadToolInput;
 	content: unknown;
 	subject: string;
@@ -112,7 +113,7 @@ function detectBuiltinImageMimeType(buffer: Buffer): string | null {
 	if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff && buffer[3] !== 0xf7) {
 		return "image/jpeg";
 	}
-	if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+	if (buffer.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
 		return "image/png";
 	}
 	if (buffer.toString("ascii", 0, 3) === "GIF") return "image/gif";
@@ -130,14 +131,13 @@ async function captureBuiltinRead(
 ): Promise<PendingRead | undefined> {
 	const { cwd, signal } = ctx;
 	let file: ReturnType<typeof fileResource> | undefined;
-	let captured: { path: string; buffer: Buffer } | undefined;
-	let beforeStamp: string | undefined;
+	let captured: Buffer | undefined;
+	let capturedStamp: string | undefined;
 	const load = async (path: string): Promise<Buffer> => {
-		if (captured?.path === path) return captured.buffer;
-		const buffer = await readFile(path);
-		captured = { path, buffer };
-		beforeStamp = createHash("sha256").update(buffer).digest("hex");
-		return buffer;
+		if (captured) return captured;
+		captured = await readFile(path);
+		capturedStamp = createHash("sha256").update(captured).digest("hex");
+		return captured;
 	};
 
 	try {
@@ -157,10 +157,10 @@ async function captureBuiltinRead(
 			},
 		});
 		const result = await read.execute(toolCallId, input, signal, undefined, ctx);
-		if (!file || !beforeStamp) return undefined;
+		if (!file || !capturedStamp) return undefined;
 		return {
 			...file,
-			beforeStamp,
+			capturedStamp,
 			input: structuredClone(input),
 			content: result.content,
 			subject: readSubject(cwd, file.path, input),
@@ -276,9 +276,8 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 			pendingReads.delete(event.toolCallId);
 			if (!event.isError && pending) {
 				const afterStamp = await hashFile(pending.path);
-				const stable =
-					afterStamp !== null &&
-					afterStamp === pending.beforeStamp &&
+				const exact =
+					afterStamp === pending.capturedStamp &&
 					isDeepStrictEqual(event.input, pending.input) &&
 					isDeepStrictEqual(event.content, pending.content);
 				adapted = {
@@ -289,7 +288,7 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 							dependencies: afterStamp
 								? [{ resource: pending.resource, facet: "content", stamp: afterStamp }]
 								: [],
-							assurance: stable ? "exact" : "unverified",
+							assurance: exact ? "exact" : "unverified",
 						},
 					],
 				};

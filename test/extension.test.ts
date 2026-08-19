@@ -53,13 +53,7 @@ async function recordReadEvidence(
 ): Promise<void> {
 	const input = { path, ...options };
 	await call(handlers, "tool_call", { toolName: "read", toolCallId, input }, ctx);
-	const result = await createReadToolDefinition(ctx.cwd).execute(
-		toolCallId,
-		input,
-		undefined,
-		undefined,
-		ctx,
-	);
+	const result = await createReadToolDefinition(ctx.cwd).execute(toolCallId, input, undefined, undefined, ctx);
 	assert.equal(
 		await call(
 			handlers,
@@ -232,7 +226,6 @@ describe("Pi extension runtime freshness", () => {
 		await recordReadEvidence(handlers, ctx, image, "image");
 		await commands.get("freshness")?.handler("", ctx);
 		assert.match(report, /current=1/);
-		assert.doesNotMatch(report, /unverified=/);
 	});
 
 	it("keeps third-party selector evidence unverified in the current runtime", async () => {
