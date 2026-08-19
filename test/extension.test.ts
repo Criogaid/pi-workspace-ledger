@@ -68,14 +68,24 @@ async function recordUserMessage(handlers: Map<string, Handler[]>, ctx: unknown,
 }
 
 const temporaryDirectories: string[] = [];
+
+async function temporaryDirectory(): Promise<string> {
+	const path = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
+	temporaryDirectories.push(path);
+	return path;
+}
+
+function headlessContext(cwd: string) {
+	return { cwd, hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+}
+
 afterEach(async () => {
 	await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
 describe("Pi extension runtime freshness", () => {
 	it("tracks reads and edits without persisting tool metadata", async () => {
-		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
-		temporaryDirectories.push(cwd);
+		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		await writeFile(source, "export const value = 1;\n");
 		let report = "";
@@ -87,7 +97,6 @@ describe("Pi extension runtime freshness", () => {
 			sessionManager: { getBranch: () => [] },
 			ui: { notify(value: string) { report = value; } },
 		};
-		await call(handlers, "session_start", { reason: "new" }, ctx);
 		await recordReadEvidence(handlers, ctx, source, "read-range", { offset: 2, limit: 3 }, 7);
 
 		await writeFile(source, "export const value = 2;\n");
@@ -111,13 +120,12 @@ describe("Pi extension runtime freshness", () => {
 	});
 
 	it("detects an out-of-band file change at the context boundary", async () => {
-		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
-		temporaryDirectories.push(cwd);
+		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		await writeFile(source, "before\n");
 		const { api, handlers } = fakePi();
 		workspaceLedgerExtension(api);
-		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+		const ctx = headlessContext(cwd);
 		await recordReadEvidence(handlers, ctx, source);
 		await writeFile(source, "after\n");
 
@@ -128,13 +136,12 @@ describe("Pi extension runtime freshness", () => {
 	});
 
 	it("keeps third-party selector evidence unverified in the current runtime", async () => {
-		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
-		temporaryDirectories.push(cwd);
+		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		await writeFile(source, "value\n");
 		const { api, handlers } = fakePi();
 		workspaceLedgerExtension(api);
-		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+		const ctx = headlessContext(cwd);
 		await call(handlers, "tool_result", {
 			toolName: "query",
 			toolCallId: "selected-1",
@@ -199,7 +206,6 @@ describe("Pi extension runtime freshness", () => {
 			sessionManager: { getBranch() { throw new Error("session branch must not be read"); } },
 			ui: { notify() {} },
 		};
-		await call(handlers, "session_start", { reason: "resume" }, ctx);
 
 		const filtered = (await call(
 			handlers,
@@ -212,8 +218,7 @@ describe("Pi extension runtime freshness", () => {
 	});
 
 	it("expires each built-in read independently after three subsequent user messages", async () => {
-		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
-		temporaryDirectories.push(cwd);
+		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		await writeFile(source, "first\nsecond\n");
 		let report = "";
@@ -258,26 +263,19 @@ describe("Pi extension runtime freshness", () => {
 		assert.equal(report, "Workspace freshness: no evidence recorded.");
 	});
 
-	it("clears runtime freshness at every lifecycle boundary", async () => {
-		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
-		temporaryDirectories.push(cwd);
+	it("clears runtime freshness when context changes within one runtime", async () => {
+		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		const resetEvents: Array<[string, string, Record<string, unknown>]> = [
-			["startup", "session_start", { reason: "startup" }],
-			["reload", "session_start", { reason: "reload" }],
-			["new", "session_start", { reason: "new" }],
-			["resume", "session_start", { reason: "resume" }],
-			["fork", "session_start", { reason: "fork" }],
 			["tree", "session_tree", { newLeafId: "new", oldLeafId: "old" }],
 			["compact", "session_compact", { compactionEntry: {} }],
-			["shutdown", "session_shutdown", { reason: "quit" }],
 		];
 
 		for (const [label, eventName, event] of resetEvents) {
 			await writeFile(source, "before\n");
 			const { api, handlers } = fakePi();
 			workspaceLedgerExtension(api);
-			const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+			const ctx = headlessContext(cwd);
 			await recordReadEvidence(handlers, ctx, source);
 			await writeFile(source, "after\n");
 			await call(handlers, eventName, event, ctx);
@@ -285,14 +283,13 @@ describe("Pi extension runtime freshness", () => {
 		}
 	});
 
-	it("keeps third-party evidence active only within the current runtime", async () => {
-		const cwd = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
-		temporaryDirectories.push(cwd);
+	it("does not expire third-party evidence with built-in read retention", async () => {
+		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		await writeFile(source, "current\n");
 		const { api, handlers } = fakePi();
 		workspaceLedgerExtension(api);
-		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+		const ctx = headlessContext(cwd);
 		await call(handlers, "tool_result", {
 			toolName: "read",
 			toolCallId: "third-party-read",
@@ -318,13 +315,10 @@ describe("Pi extension runtime freshness", () => {
 			messages: Array<{ content: unknown }>;
 		};
 		assert.match(String(active.messages.at(-1)?.content), /read source\.ts/);
-		await call(handlers, "session_start", { reason: "reload" }, ctx);
-		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
 	});
 
 	it("tracks logical workspace symlinks but ignores direct outside reads", async () => {
-		const root = await mkdtemp(join(tmpdir(), "pi-workspace-ledger-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const cwd = join(root, "workspace");
 		const firstTarget = join(root, "target-a");
 		const secondTarget = join(root, "target-b");
@@ -339,7 +333,7 @@ describe("Pi extension runtime freshness", () => {
 		const source = join(link, "source.ts");
 		const { api, handlers } = fakePi();
 		workspaceLedgerExtension(api);
-		const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+		const ctx = headlessContext(cwd);
 
 		await recordReadEvidence(handlers, ctx, join(firstTarget, "source.ts"), "outside");
 		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
@@ -355,7 +349,7 @@ describe("Pi extension runtime freshness", () => {
 	it("preserves similar tool output while removing marked legacy notices", async () => {
 		const { api, handlers } = fakePi();
 		workspaceLedgerExtension(api);
-		const ctx = { cwd: tmpdir(), hasUI: false, sessionManager: { getBranch: () => [] }, ui: { notify() {} } };
+		const ctx = headlessContext(tmpdir());
 		const message = {
 			role: "toolResult",
 			toolCallId: "other-tool",

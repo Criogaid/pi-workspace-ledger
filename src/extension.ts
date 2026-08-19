@@ -6,14 +6,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { envelopeFromDetails, mergeEnvelopes, type FreshnessEnvelopeV1, type JsonValue } from "./envelope.js";
 import { LedgerState, type EvidenceView } from "./ledger.js";
-import { renderFreshnessNotice, renderFreshnessReport } from "./render.js";
+import {
+	FRESHNESS_NOTICE_HEADER,
+	renderFreshnessNotice,
+	renderFreshnessReport,
+} from "./render.js";
 
 const NOTICE_DETAILS_KEY = "pi-workspace-ledger/notice";
 const NOTICE_MESSAGE_TYPE = "pi-workspace-ledger-notice";
 const SAFETY_MESSAGE_TYPE = "pi-workspace-ledger-safety-fallback";
-const FRESHNESS_NOTICE_PREFIX = "Workspace freshness (machine-generated status):";
 const READ_RETENTION_USER_MESSAGES = 3;
-const MUTATION_TOOLS = new Set(["edit", "write"]);
 
 interface PendingRead {
 	path: string;
@@ -131,7 +133,7 @@ function isFreshnessNoticePart(value: unknown): boolean {
 		isRecord(value) &&
 		value.type === "text" &&
 		typeof value.text === "string" &&
-		value.text.startsWith(FRESHNESS_NOTICE_PREFIX)
+		value.text.startsWith(FRESHNESS_NOTICE_HEADER)
 	);
 }
 
@@ -214,10 +216,9 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 		userMessageIndex = 0;
 	};
 
-	pi.on("session_start", resetRuntime);
+	// Pi 会为 session 替换创建新扩展实例；这里只处理实例内的上下文重写。
 	pi.on("session_tree", resetRuntime);
 	pi.on("session_compact", resetRuntime);
-	pi.on("session_shutdown", resetRuntime);
 
 	pi.on("message_end", (event) => {
 		if (event.message.role === "user") userMessageIndex++;
@@ -263,7 +264,7 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 				};
 				readEvidenceIndex = existing?.evidence?.length ?? 0;
 			}
-		} else if (!event.isError && MUTATION_TOOLS.has(event.toolName)) {
+		} else if (!event.isError && (event.toolName === "edit" || event.toolName === "write")) {
 			const requestedPath = inputPath(event.input);
 			if (requestedPath) {
 				const file = fileResource(ctx.cwd, requestedPath);

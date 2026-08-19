@@ -1,9 +1,9 @@
 import type { EvidenceStatus, EvidenceView } from "./ledger.js";
 
-const MODEL_VISIBLE_STATUSES = new Set<EvidenceStatus>(["stale", "unverified"]);
+export const FRESHNESS_NOTICE_HEADER = "Workspace freshness (machine-generated status):";
 
-export function abnormalEvidence(records: EvidenceView[]): EvidenceView[] {
-	return records.filter((record) => MODEL_VISIBLE_STATUSES.has(record.status));
+function abnormalEvidence(records: EvidenceView[]): EvidenceView[] {
+	return records.filter(({ status }) => status === "stale" || status === "unverified");
 }
 
 function oneLine(value: string, maxLength = 180): string {
@@ -33,10 +33,7 @@ export function renderFreshnessNotice(records: EvidenceView[], limit = 8): strin
 	if (visible.length === 0) return undefined;
 
 	const omitted = abnormal.length - visible.length;
-	const lines = [
-		"Workspace freshness (machine-generated status):",
-		...visible.flatMap(noticeLinesFor),
-	];
+	const lines = [FRESHNESS_NOTICE_HEADER, ...visible.flatMap(noticeLinesFor)];
 	if (omitted > 0) lines.push(`- ${omitted} additional stale or unverified item(s) omitted.`);
 	return lines.join("\n");
 }

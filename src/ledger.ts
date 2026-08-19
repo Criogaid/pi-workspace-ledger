@@ -1,4 +1,4 @@
-import type { Assurance, Change, Evidence, FreshnessEnvelopeV1, JsonValue, ResourceStamp } from "./envelope.js";
+import type { Assurance, Change, Evidence, FreshnessEnvelopeV1, JsonValue } from "./envelope.js";
 
 export type EvidenceStatus = "current" | "current-conservative" | "stale" | "unverified" | "superseded";
 
@@ -25,9 +25,9 @@ export type LedgerEvent =
 			missing?: boolean;
 		};
 
-interface ResourceState extends ResourceStamp {
+interface ResourceState extends Change {
+	stamp: string | null;
 	changed: boolean;
-	known: boolean;
 }
 
 function selectorKey(selector: JsonValue | undefined): string {
@@ -101,7 +101,6 @@ export class LedgerState {
 			this.#resources.set(resourceKey(dependency.resource, dependency.facet, dependency.selector), {
 				...dependency,
 				changed: false,
-				known: true,
 			});
 		}
 
@@ -128,24 +127,20 @@ export class LedgerState {
 		const key = resourceKey(event.resource, event.facet, event.selector);
 		const state = this.#resources.get(key);
 		if (state) {
-			if (event.stamp !== null) {
-				state.changed = false;
-				state.known = true;
-				state.stamp = event.stamp;
-			} else {
+			if (event.stamp === null) {
 				// 无法解析不能推翻已经观察到的 change；missing 则进一步证明 stale。
 				if (event.missing === true) state.changed = true;
-				state.known = false;
-				state.stamp = "";
+			} else {
+				state.changed = false;
 			}
+			state.stamp = event.stamp;
 		} else {
 			this.#resources.set(key, {
 				resource: event.resource,
 				facet: event.facet,
 				...(event.selector === undefined ? {} : { selector: event.selector }),
-				stamp: event.stamp ?? "",
+				stamp: event.stamp,
 				changed: event.stamp === null && event.missing === true,
-				known: event.stamp !== null,
 			});
 		}
 		this.recompute();
@@ -154,11 +149,8 @@ export class LedgerState {
 	private recompute(): void {
 		for (const record of this.#records.values()) {
 			if (record.status === "superseded") continue;
-			if (record.dependencies.length === 0) {
-				record.status = "unverified";
-				record.reasons = ["producer did not declare complete dependencies"];
-				continue;
-			}
+			const incompleteCoverage =
+				record.dependencies.length === 0 || record.assurance === "unverified";
 
 			const staleReasons: string[] = [];
 			const unknownReasons: string[] = [];
@@ -166,7 +158,7 @@ export class LedgerState {
 				const state = this.#resources.get(resourceKey(dependency.resource, dependency.facet, dependency.selector));
 				if (state?.changed) {
 					staleReasons.push(`${dependency.resource} changed or disappeared`);
-				} else if (!state || !state.known) {
+				} else if (!state || state.stamp === null) {
 					unknownReasons.push(`${dependency.resource} cannot be resolved`);
 				} else if (state.stamp !== dependency.stamp) {
 					staleReasons.push(`${dependency.resource} has a different ${dependency.facet} stamp`);
@@ -176,12 +168,12 @@ export class LedgerState {
 			if (staleReasons.length > 0) {
 				record.status = "stale";
 				record.reasons = staleReasons;
-			} else if (record.assurance === "unverified") {
+			} else if (incompleteCoverage || unknownReasons.length > 0) {
 				record.status = "unverified";
-				record.reasons = ["producer did not declare complete dependencies", ...unknownReasons];
-			} else if (unknownReasons.length > 0) {
-				record.status = "unverified";
-				record.reasons = unknownReasons;
+				record.reasons = [
+					...(incompleteCoverage ? ["producer did not declare complete dependencies"] : []),
+					...unknownReasons,
+				];
 			} else {
 				record.status = currentStatus(record.assurance);
 				record.reasons = [];
