@@ -116,11 +116,26 @@ describe("Pi extension runtime freshness", () => {
 			messages: Array<{ content: unknown }>;
 		};
 		assert.deepEqual(contextPatch.messages.slice(0, -1), messages);
-		assert.match(String(contextPatch.messages.at(-1)?.content), /read source\.ts lines 2-4/);
+		assert.match(String(contextPatch.messages.at(-1)?.content), /read source\.ts/);
 		assert.match(String(contextPatch.messages.at(-1)?.content), /STALE/);
 		assert.deepEqual(customEntries, []);
 		await commands.get("freshness")?.handler("", ctx);
 		assert.match(report, /stale=1/);
+	});
+
+	it("replaces stale partial-read evidence with the latest read of the file", async () => {
+		const cwd = await temporaryDirectory();
+		const source = join(cwd, "source.ts");
+		await writeFile(source, "before\nsecond\n");
+		const { api, handlers } = fakePi();
+		workspaceLedgerExtension(api);
+		const ctx = headlessContext(cwd);
+		await recordReadEvidence(handlers, ctx, source, "read-first", { offset: 1, limit: 1 });
+
+		await writeFile(source, "after\nsecond\n");
+		await recordReadEvidence(handlers, ctx, source, "read-second", { offset: 2, limit: 1 });
+
+		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
 	});
 
 	it("detects an out-of-band file change at the context boundary", async () => {
@@ -304,7 +319,8 @@ describe("Pi extension runtime freshness", () => {
 	it("expires each built-in read independently after three subsequent user messages", async () => {
 		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
-		await writeFile(source, "first\nsecond\n");
+		const second = join(cwd, "second.ts");
+		await Promise.all([writeFile(source, "first\n"), writeFile(second, "second\n")]);
 		let report = "";
 		const { api, handlers, commands } = fakePi();
 		workspaceLedgerExtension(api);
@@ -317,8 +333,8 @@ describe("Pi extension runtime freshness", () => {
 		await recordReadEvidence(handlers, ctx, source, "read-full");
 		await recordUserMessage(handlers, ctx, "user-1");
 		await recordUserMessage(handlers, ctx, "user-2");
-		await recordReadEvidence(handlers, ctx, source, "read-range", { offset: 2, limit: 1 });
-		await writeFile(source, "first\nchanged\n");
+		await recordReadEvidence(handlers, ctx, second, "read-second");
+		await Promise.all([writeFile(source, "changed\n"), writeFile(second, "changed\n")]);
 		await recordUserMessage(handlers, ctx, "user-3");
 		await recordUserMessage(handlers, ctx, "user-4");
 
@@ -326,8 +342,8 @@ describe("Pi extension runtime freshness", () => {
 			messages: Array<{ content: unknown }>;
 		};
 		const notice = String(active.messages.at(-1)?.content);
-		assert.match(notice, /read source\.ts lines 2-2/);
-		assert.doesNotMatch(notice, /^- STALE: "read source\.ts"$/m);
+		assert.match(notice, /read second\.ts/);
+		assert.doesNotMatch(notice, /read source\.ts/);
 
 		await recordUserMessage(handlers, ctx, "user-5");
 		const third = (await call(handlers, "context", { messages: [] }, ctx)) as {

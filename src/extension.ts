@@ -97,15 +97,8 @@ function displayPath(cwd: string, path: string): string {
 	return value.length > 0 && !value.startsWith("..") ? value.replaceAll("\\", "/") : path;
 }
 
-function readSubject(cwd: string, path: string, input: unknown): string {
-	const base = `read ${displayPath(cwd, path)}`;
-	if (!isRecord(input)) return base;
-	const offset = Number.isInteger(input.offset) && Number(input.offset) > 0 ? Number(input.offset) : undefined;
-	const limit = Number.isInteger(input.limit) && Number(input.limit) > 0 ? Number(input.limit) : undefined;
-	if (!offset && !limit) return base;
-	if (!limit) return `${base} from line ${offset}`;
-	const start = offset ?? 1;
-	return `${base} lines ${start}-${start + limit - 1}`;
+function readSubject(cwd: string, path: string): string {
+	return `read ${displayPath(cwd, path)}`;
 }
 
 // ponytail: 异常 PNG/BMP 可能降为 unverified；Pi 导出 MIME detector 后直接复用。
@@ -163,7 +156,7 @@ async function captureBuiltinRead(
 			capturedStamp,
 			input: structuredClone(input),
 			content: result.content,
-			subject: readSubject(cwd, file.path, input),
+			subject: readSubject(cwd, file.path),
 		};
 	} catch {
 		return undefined;

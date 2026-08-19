@@ -56,9 +56,9 @@ Use the extension normally; freshness checks happen automatically before model r
 
 ## Evidence Lifetime
 
-- Each adapted built-in read stays active through the next three live `role: user` messages and expires before the fourth subsequent message is projected.
+- The latest adapted built-in read for each file stays active through the next three live `role: user` messages and expires before the fourth subsequent message is projected.
 - A read made while handling the current user message does not consume that message's lifetime.
-- Each adapted built-in read expires independently.
+- Reads of different files expire independently; a newer read of the same file supersedes the older evidence.
 - Envelope-provided evidence has no message-count expiry; it remains until superseded or the runtime is reset.
 - State lives only in the current extension instance and is never restored from session JSONL.
 - Restarting, resuming, reloading, forking, or cloning starts with empty freshness state. Tree changes and compaction also clear current runtime state.
