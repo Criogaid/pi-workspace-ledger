@@ -198,7 +198,7 @@ describe("Pi extension runtime freshness", () => {
 		assert.match(String(projection.messages.at(-1)?.content), /STALE/);
 	});
 
-	it("ignores read overrides instead of tracking a local namesake", async () => {
+	it("keeps read overrides unverified when their output cannot be reproduced", async () => {
 		const cwd = await temporaryDirectory();
 		const source = join(cwd, "source.ts");
 		await writeFile(source, "local\n");
@@ -215,9 +215,11 @@ describe("Pi extension runtime freshness", () => {
 			details: {},
 			isError: false,
 		}, ctx);
-		await writeFile(source, "changed locally\n");
 
-		assert.equal(await call(handlers, "context", { messages: [] }, ctx), undefined);
+		const projection = (await call(handlers, "context", { messages: [] }, ctx)) as {
+			messages: Array<{ content: unknown }>;
+		};
+		assert.match(String(projection.messages.at(-1)?.content), /UNVERIFIED/);
 	});
 
 	it("keeps supported image reads exact", async () => {

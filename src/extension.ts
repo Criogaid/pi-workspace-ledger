@@ -252,8 +252,6 @@ export default function workspaceLedgerExtension(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "read") return;
-		const readTool = pi.getAllTools().find((tool) => tool.name === "read");
-		if (readTool?.sourceInfo.source !== "builtin") return;
 
 		const pending = await captureBuiltinRead(event.toolCallId, event.input as ReadToolInput, ctx);
 		if (pending) pendingReads.set(event.toolCallId, pending);
